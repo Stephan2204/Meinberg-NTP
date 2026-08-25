@@ -35,6 +35,7 @@
 #include <WiFiUdp.h>
 #include <WebServer.h>
 #include <Update.h>
+#include <Preferences.h>
 #include "lwip/dhcp.h"
 #include "lwip/pbuf.h"
 #include "esp_timer.h"
@@ -71,18 +72,54 @@ static constexpr double LOCKED_BASE_DISPERSION_S = 0.005; // 5 ms
 
 // Debug output over UART0.
 static constexpr bool DEBUG_OUTPUT = true;
-static const char *FIRMWARE_VERSION = "v7.4";
+static const char *FIRMWARE_VERSION = "v7.5";
 
 // Status helpers are implemented below and also used by Syslog.
 static String rawStatusString();
 static String meinbergStateText();
 static String currentNtpStateText();
+static String htmlEscape(const String &s);
 
 // ------------------------- Ethernet / UDP -------------------------
 
 WiFiUDP udp;
 WiFiUDP syslogUdp;
 WebServer web(80);
+
+// ------------------------- Web security -------------------------
+// Credentials are stored in ESP32 NVS and survive reboot/OTA updates.
+// HTTP Basic Authentication protects administrative actions.
+// Note: Basic Auth over plain HTTP does not encrypt credentials on the wire.
+Preferences securityPrefs;
+static String webAdminUser;
+static String webAdminPassword;
+static bool webAdminConfigured = false;
+static bool otaUploadAuthorized = false;
+
+static void loadWebSecurity() {
+  if (!securityPrefs.begin("webadmin", true)) {
+    webAdminConfigured = false;
+    return;
+  }
+  webAdminUser = securityPrefs.getString("user", "");
+  webAdminPassword = securityPrefs.getString("pass", "");
+  securityPrefs.end();
+  webAdminConfigured = !webAdminUser.isEmpty() && !webAdminPassword.isEmpty();
+}
+
+static bool requireWebAdmin() {
+  if (!webAdminConfigured) {
+    web.send(403, "text/plain; charset=utf-8",
+             "Web administrator credentials are not configured yet.");
+    return false;
+  }
+  if (web.authenticate(webAdminUser.c_str(), webAdminPassword.c_str())) {
+    return true;
+  }
+  web.requestAuthentication(BASIC_AUTH, "Meinberg NTP Admin");
+  return false;
+}
+
 
 // ------------------------- Meinberg UART parser -------------------------
 
@@ -743,6 +780,7 @@ static void monitorStateForSyslog() {
 // ------------------------- Firmware update (Web OTA) -------------------------
 
 static void handleUpdatePage() {
+  if (!requireWebAdmin()) return;
   String page;
   page.reserve(2500);
   page += F(
@@ -770,6 +808,11 @@ static void handleUpdatePage() {
 }
 
 static void handleUpdateFinished() {
+  if (!otaUploadAuthorized || !requireWebAdmin()) {
+    otaUploadAuthorized = false;
+    return;
+  }
+  otaUploadAuthorized = false;
   const bool error = Update.hasError();
 
   web.sendHeader("Connection", "close");
@@ -790,6 +833,13 @@ static void handleUpdateUpload() {
   HTTPUpload &upload = web.upload();
 
   if (upload.status == UPLOAD_FILE_START) {
+    otaUploadAuthorized =
+        webAdminConfigured &&
+        web.authenticate(webAdminUser.c_str(), webAdminPassword.c_str());
+    if (!otaUploadAuthorized) {
+      if (DEBUG_OUTPUT) Serial.println("OTA: rejected unauthorized upload");
+      return;
+    }
     if (DEBUG_OUTPUT) {
       Serial.printf("OTA: start %s\n", upload.filename.c_str());
     }
@@ -800,6 +850,7 @@ static void handleUpdateUpload() {
     }
   }
   else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (!otaUploadAuthorized) return;
     if (!Update.hasError()) {
       const size_t written = Update.write(upload.buf, upload.currentSize);
       if (written != upload.currentSize && DEBUG_OUTPUT) {
@@ -808,6 +859,7 @@ static void handleUpdateUpload() {
     }
   }
   else if (upload.status == UPLOAD_FILE_END) {
+    if (!otaUploadAuthorized) return;
     if (!Update.hasError()) {
       if (Update.end(true)) {
         if (DEBUG_OUTPUT) {
@@ -820,10 +872,99 @@ static void handleUpdateUpload() {
     }
   }
   else if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (!otaUploadAuthorized) return;
     Update.abort();
     if (DEBUG_OUTPUT) Serial.println("OTA: aborted");
     sendSyslog(4, "OTA upload aborted");
   }
+}
+
+
+// ------------------------- Web security pages -------------------------
+static String securityPage(const String &message = String()) {
+  String page;
+  page.reserve(4200);
+  page += F(
+    "<!doctype html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Web Security</title>"
+    "<style>"
+    "body{font-family:system-ui,sans-serif;max-width:700px;margin:2rem auto;padding:0 1rem;background:#f5f5f5;color:#222}"
+    ".box{background:white;padding:1.2rem;border-radius:.4rem}"
+    "label{display:block;margin-top:.8rem;font-weight:600}"
+    "input,button{font-size:1rem;padding:.55rem;margin-top:.25rem;max-width:100%;box-sizing:border-box}"
+    ".ok{color:#17823b;font-weight:700}.warn{color:#8a4b00}"
+    "</style></head><body><h1>Meinberg NTP Web Security</h1><div class='box'>"
+  );
+  if (!message.isEmpty()) {
+    page += F("<p class='ok'>");
+    page += message;
+    page += F("</p>");
+  }
+  if (!webAdminConfigured) {
+    page += F("<p class='warn'><b>Initial setup:</b> create the administrator credentials before firmware update and reboot are enabled.</p>");
+  } else {
+    page += F("<p>Web administrator: <b>");
+    page += htmlEscape(webAdminUser);
+    page += F("</b></p><p>Enter new credentials below to change them.</p>");
+  }
+  page += F(
+    "<form method='POST' action='/security'>"
+    "<label for='user'>Username</label>"
+    "<input id='user' name='user' autocomplete='username' minlength='1' maxlength='32' required>"
+    "<label for='pass'>Password</label>"
+    "<input id='pass' name='pass' type='password' autocomplete='new-password' minlength='8' maxlength='64' required>"
+    "<label for='confirm'>Confirm password</label>"
+    "<input id='confirm' name='confirm' type='password' autocomplete='new-password' minlength='8' maxlength='64' required><br>"
+    "<button type='submit'>Save credentials</button>"
+    "</form><p><a href='/'>Back to status</a></p></div></body></html>"
+  );
+  return page;
+}
+
+static void handleSecurityPage() {
+  // First-time setup is intentionally accessible without credentials because none exist.
+  // Once configured, changing credentials requires the current login.
+  if (webAdminConfigured && !requireWebAdmin()) return;
+  web.send(200, "text/html; charset=utf-8", securityPage());
+}
+
+static void handleSecuritySave() {
+  if (webAdminConfigured && !requireWebAdmin()) return;
+
+  String user = web.arg("user");
+  String pass = web.arg("pass");
+  String confirm = web.arg("confirm");
+  user.trim();
+
+  if (user.isEmpty() || user.length() > 32 ||
+      pass.length() < 8 || pass.length() > 64 ||
+      pass != confirm) {
+    web.send(400, "text/html; charset=utf-8",
+             securityPage("Invalid input: password must be 8-64 characters and both passwords must match."));
+    return;
+  }
+
+  if (!securityPrefs.begin("webadmin", false)) {
+    web.send(500, "text/plain; charset=utf-8", "Unable to open NVS.");
+    return;
+  }
+  const size_t u = securityPrefs.putString("user", user);
+  const size_t p = securityPrefs.putString("pass", pass);
+  securityPrefs.end();
+
+  if (u == 0 || p == 0) {
+    web.send(500, "text/plain; charset=utf-8", "Unable to save credentials.");
+    return;
+  }
+
+  webAdminUser = user;
+  webAdminPassword = pass;
+  webAdminConfigured = true;
+
+  sendSyslog(5, "web administrator credentials configured/changed");
+  web.send(200, "text/html; charset=utf-8",
+           securityPage("Credentials saved. Firmware update and reboot are now protected."));
 }
 
 // ------------------------- Status web page -------------------------
@@ -931,7 +1072,13 @@ static void handleRoot() {
     "<div class='note'>WT32-ETH01 &middot; firmware "
   );
   page += FIRMWARE_VERSION;
-  page += F(" &middot; auto refresh every 2 s &middot; <a href='/update'>Firmware Update</a></div>");
+  page += F(" &middot; auto refresh every 2 s");
+  if (webAdminConfigured) {
+    page += F(" &middot; <a href='/update'>Firmware Update</a>");
+  } else {
+    page += F(" &middot; <a href='/security'>Set Web Password</a>");
+  }
+  page += F("</div>");
 
   // 1) Meinberg / DCF77
   page += F("<h2>Meinberg / DCF77</h2><table>");
@@ -1044,10 +1191,18 @@ static void handleRoot() {
   page += FIRMWARE_VERSION;
   page += F("</td></tr><tr><td>Uptime</td><td>");
   page += uptimeText();
-  page += F("</td></tr><tr><td>Restart</td><td>");
-  page += F("<form method='POST' action='/reboot' style='margin:0' "
-            "onsubmit=\"return confirm('Restart NTP server now?');\">"
-            "<button type='submit'>Reboot</button></form>");
+  page += F("</td></tr><tr><td>Web admin</td><td><span class='");
+  page += webAdminConfigured ? F("ok'>ENABLED") : F("bad'>NOT CONFIGURED");
+  page += F("</span> &middot; <a href='/security'>");
+  page += webAdminConfigured ? F("Change credentials") : F("Set credentials");
+  page += F("</a></td></tr><tr><td>Restart</td><td>");
+  if (webAdminConfigured) {
+    page += F("<form method='POST' action='/reboot' style='margin:0' "
+              "onsubmit=\"return confirm('Restart NTP server now?');\">"
+              "<button type='submit'>Reboot</button></form>");
+  } else {
+    page += F("Disabled until web credentials are configured");
+  }
   page += F("</td></tr></table>");
 
   page += F(
@@ -1109,6 +1264,7 @@ static void handleStatusJson() {
 
 
 static void handleReboot() {
+  if (!requireWebAdmin()) return;
   web.send(
       200,
       "text/html; charset=utf-8",
@@ -1129,6 +1285,8 @@ static void handleReboot() {
 static void startWebServer() {
   web.on("/", HTTP_GET, handleRoot);
   web.on("/status.json", HTTP_GET, handleStatusJson);
+  web.on("/security", HTTP_GET, handleSecurityPage);
+  web.on("/security", HTTP_POST, handleSecuritySave);
   web.on("/update", HTTP_GET, handleUpdatePage);
   web.on("/update", HTTP_POST, handleUpdateFinished, handleUpdateUpload);
   web.on("/reboot", HTTP_POST, handleReboot);
@@ -1206,7 +1364,7 @@ void setup() {
 
   if (DEBUG_OUTPUT) {
     Serial.println();
-    Serial.println("Meinberg UA537TGP NTP server v7.4 / WT32-ETH01");
+    Serial.println("Meinberg UA537TGP NTP server v7.5 / WT32-ETH01");
     Serial.print("Firmware: ");
     Serial.println(FIRMWARE_VERSION);
     Serial.println("UART0 reserved for flash/debug");
@@ -1234,6 +1392,7 @@ void setup() {
     if (DEBUG_OUTPUT) Serial.println("Failed to bind UDP/123");
   }
 
+  loadWebSecurity();
   startWebServer();
 
   previousEthLink = ETH.linkUp();
