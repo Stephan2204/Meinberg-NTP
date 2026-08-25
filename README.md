@@ -415,6 +415,31 @@ In particular:
 -   Work on mains-powered equipment only when you are qualified to do
     so.
 
+
+## Web administration security (v7.5)
+
+Firmware update and reboot are protected with HTTP Basic Authentication.
+
+On the first boot after installing v7.5, no administrator credentials exist yet.
+Open `/security` (or use **Set Web Password** on the status page) and create a username
+and password. The password must contain at least 8 characters.
+
+The credentials are stored in ESP32 NVS using the Arduino `Preferences` API and survive
+normal restarts and OTA firmware updates. Once credentials have been configured:
+
+- `/update` requires authentication for both the update page and the firmware upload itself.
+- `/reboot` requires authentication.
+- `/security` requires the current authentication before credentials can be changed.
+- `/` and `/status.json` remain read-only and publicly accessible on the local network.
+
+**Important:** this firmware currently serves plain HTTP. HTTP Basic Authentication
+prevents unauthenticated administrative actions, but it does not encrypt credentials
+while they travel over the network. Use it only on a trusted LAN.
+
+If the administrator password is lost, recovery requires local access to the ESP32
+(for example erasing/reinitializing its NVS/flash and reflashing the firmware).
+
+
 ## Documentation images
 
 The hardware photograph and DIL-switch table image in `docs/images/`
