@@ -319,8 +319,8 @@ Logging is event-based rather than periodic. Examples include:
 Example:
 
 ``` text
-meinberg-ntp syslog configured via DHCP option 7; server=192.168.1.8; firmware=v7.4
-meinberg-ntp startup state; ip=192.168.1.40; dcf_status=[#*  ]; psek=unstable; ntp=NO TIME; stratum=16
+meinberg-ntp syslog configured via DHCP option 7; server=192.168.222.4; firmware=v7.4
+meinberg-ntp startup state; ip=192.168.222.99; dcf_status=[#*  ]; psek=unstable; ntp=NO TIME; stratum=16
 meinberg-ntp P_SEK stable=YES; interval_us=1000011
 ```
 
