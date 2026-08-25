@@ -415,11 +415,6 @@ In particular:
 -   Work on mains-powered equipment only when you are qualified to do
     so.
 
-## License
-
-Choose a license appropriate for your repository before publishing. MIT
-is a common choice for small hardware/firmware projects.
-
 ## Documentation images
 
 The hardware photograph and DIL-switch table image in `docs/images/`
@@ -427,3 +422,8 @@ document the actual reference unit used to develop and test this
 project. The DIL table is included as a practical reference only; the
 original equipment documentation for the exact receiver revision remains
 authoritative.
+
+## Credit
+The intitial idea for the code was taken from this project:
+https://github.com/G-3-3-R-T/gps-ntp-wt32-eth01
+
