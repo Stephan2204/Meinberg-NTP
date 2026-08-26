@@ -1,0 +1,16 @@
+{
+  "name": "Meinberg UA537TGP Ethernet NTP Server",
+  "version": "v7.5.2",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        {
+          "path": "meinberg-ntp-v7.5.2-factory.bin",
+          "offset": 0
+        }
+      ]
+    }
+  ]
+}
