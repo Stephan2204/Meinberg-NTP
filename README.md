@@ -319,7 +319,7 @@ Logging is event-based rather than periodic. Examples include:
 Example:
 
 ``` text
-meinberg-ntp syslog configured via DHCP option 7; server=192.168.222.4; firmware=v7.4
+meinberg-ntp syslog configured via DHCP option 7; server=192.168.222.4; firmware=v7.5.2
 meinberg-ntp startup state; ip=192.168.222.99; dcf_status=[#*  ]; psek=unstable; ntp=NO TIME; stratum=16
 meinberg-ntp P_SEK stable=YES; interval_us=1000011
 ```
@@ -352,13 +352,13 @@ while pulling Arduino-ESP32 in as an ESP-IDF component.
 
 Build with:
 
-``` bash
+```bash
 pio run
 ```
 
 For a completely clean rebuild:
 
-``` bash
+```bash
 rm -rf .pio sdkconfig
 pio run
 ```
@@ -366,19 +366,174 @@ pio run
 The managed ESP-IDF/Arduino components may remain cached in
 `managed_components/`.
 
-The OTA firmware image is generated as:
+Starting with **v7.5.2**, a normal `pio run` also creates two release
+images in the `release/` directory:
 
-``` text
-.pio/build/wt32-eth01/firmware.bin
+```text
+release/
+├── meinberg-ntp-v7.5.2-ota.bin
+├── meinberg-ntp-v7.5.2-factory.bin
+└── manifest.json
 ```
+
+`*-ota.bin` is the application image for an already running Meinberg
+NTP server. `*-factory.bin` is a merged ESP32 image containing all flash
+parts required for an initial installation.
+
+The release files are intentionally ignored by Git. They are suitable
+as binary assets for a GitHub Release.
+
+## Release files – which image should I use?
+
+Each release provides two firmware images for different purposes:
+
+| File | Purpose |
+|---|---|
+| `meinberg-ntp-vX.Y.Z-factory.bin` | **First installation / recovery** of a new or erased WT32-ETH01 |
+| `meinberg-ntp-vX.Y.Z-ota.bin` | **Firmware update** of an already running Meinberg NTP server via the Web interface |
+
+### Factory image
+
+Use the `*-factory.bin` image when installing the firmware on a
+WT32-ETH01 for the first time.
+
+It is a merged ESP32 flash image containing the application and the
+additional flash components required for a complete installation,
+including the bootloader and partition information.
+
+Flash the factory image at address `0x0`.
+
+Example:
+
+```bash
+python -m esptool --chip esp32 -p /dev/ttyUSB0 write_flash 0x0 \
+  meinberg-ntp-vX.Y.Z-factory.bin
+```
+
+Replace `/dev/ttyUSB0` with the serial port used on your system.
+
+The factory image can also be used for recovery when the existing flash
+contents should be replaced completely.
+
+**Do not upload the factory image using the Web Firmware Update page.**
+
+### OTA image
+
+Use the `*-ota.bin` image for normal firmware updates on an already
+installed and running Meinberg NTP server.
+
+Open the device Web interface, select **Firmware Update**, authenticate
+with the configured Web administrator credentials, and upload:
+
+```text
+meinberg-ntp-vX.Y.Z-ota.bin
+```
+
+From firmware v7.5 onward, firmware update and reboot are protected by
+the configured Web administrator credentials.
+
+**Do not flash the OTA image at address `0x0` for a first installation.**
+
+### Quick decision
+
+```text
+New / erased WT32-ETH01
+        |
+        +--> factory.bin --> serial flashing / ESP Web Tools
+
+Existing Meinberg NTP server
+        |
+        +--> ota.bin --> Web Firmware Update
+```
+
+## First installation
+
+A new or erased WT32-ETH01 cannot be initialized with the OTA
+`firmware.bin` alone. The ESP32 also needs its bootloader, partition
+table and OTA metadata at their correct flash offsets.
+
+There are three practical installation methods.
+
+### Method 1: PlatformIO upload
+
+Connect an FT232, CH340 or similar USB-to-UART adapter to UART0 of the
+WT32-ETH01. The UART logic level must be **3.3 V**.
+
+Typical wiring:
+
+| USB-to-UART adapter | WT32-ETH01 |
+|---|---|
+| GND | GND |
+| TXD | GPIO3 / RX0 |
+| RXD | GPIO1 / TX0 |
+
+TX and RX are crossed: adapter TXD goes to WT32 RX0, and adapter RXD
+goes to WT32 TX0.
+
+Power the WT32-ETH01 through its normal **5 V input**. Do not rely on
+the 3.3 V output of an FT232/CH340 adapter to power the complete
+WT32-ETH01 board.
+
+To enter the ESP32 serial bootloader:
+
+1. Connect **GPIO0 to GND**.
+2. Reset or power-cycle the WT32-ETH01.
+3. Release GPIO0 again.
+4. Start the upload.
+
+Then run:
+
+```bash
+pio run -t upload
+```
+
+PlatformIO/esptool writes all required parts to their proper addresses.
+
+### Method 2: merged factory image with esptool
+
+After `pio run`, use the generated merged image:
+
+```bash
+python -m esptool --chip esp32 -p /dev/ttyUSB0 write_flash 0x0 \
+  release/meinberg-ntp-v7.5.2-factory.bin
+```
+
+Replace `/dev/ttyUSB0` with the serial port used on your system.
+
+The merged factory image is intended for a **first installation or full
+recovery**. It may initialize/replace the bootloader, partition table
+and OTA metadata, so do not use it as the normal Web OTA image.
+
+### Method 3: browser installation with ESP Web Tools
+
+ESP Web Tools can install ESP32 firmware through Web Serial. For ESP32
+firmware built with modern ESP-IDF it requires a **merged firmware
+image**, not the application-only OTA binary.
+
+The generated `release/manifest.json` references the generated
+`*-factory.bin` at flash offset `0x0`. Host the manifest and factory
+binary together on an HTTPS website (for example GitHub Pages), then
+point an ESP Web Tools install button at that manifest.
+
+The browser used for installation must support Web Serial, and the page
+must be served over HTTPS.
 
 ## Firmware updates
 
-After the initial wired/serial flash, later firmware versions can be
-installed using the built-in Web OTA page.
+After the initial installation, use the built-in Web OTA page for
+normal upgrades.
 
-This is especially useful when the WT32-ETH01 is permanently installed
-inside the Meinberg chassis.
+Upload only:
+
+```text
+meinberg-ntp-vX.Y.Z-ota.bin
+```
+
+Do **not** upload the merged `*-factory.bin` through the device's Web OTA
+page.
+
+From v7.5 onward, firmware update and reboot require the Web
+administrator credentials configured under `/security`.
 
 ## Tested setup
 
@@ -415,45 +570,28 @@ In particular:
 -   Work on mains-powered equipment only when you are qualified to do
     so.
 
-
-## Web administration security (v7.5)
-
-Firmware update and reboot are protected with HTTP Basic Authentication.
-
-On the first boot after installing v7.5, no administrator credentials exist yet.
-Open `/security` (or use **Set Web Password** on the status page) and create a username
-and password. The password must contain at least 8 characters.
-
-The credentials are stored in ESP32 NVS using the Arduino `Preferences` API and survive
-normal restarts and OTA firmware updates. Once credentials have been configured:
-
-- `/update` requires authentication for both the update page and the firmware upload itself.
-- `/reboot` requires authentication.
-- `/security` requires the current authentication before credentials can be changed.
-- `/` and `/status.json` remain read-only and publicly accessible on the local network.
-
-**Important:** this firmware currently serves plain HTTP. HTTP Basic Authentication
-prevents unauthenticated administrative actions, but it does not encrypt credentials
-while they travel over the network. Use it only on a trusted LAN.
-
-If the administrator password is lost, recovery requires local access to the ESP32
-(for example erasing/reinitializing its NVS/flash and reflashing the firmware).
-
-
-## Documentation images
-
-The hardware photograph and DIL-switch table image in `docs/images/`
-document the actual reference unit used to develop and test this
-project. The DIL table is included as a practical reference only; the
-original equipment documentation for the exact receiver revision remains
-authoritative.
-
-
 ## License
 
-Licensed under the Apache License 2.0
+Licensed under the Apache License 2.0.
 
 ## Credit
-The intitial idea for the code was taken from this project:
+
+The initial idea for the code was taken from this project:
 https://github.com/G-3-3-R-T/gps-ntp-wt32-eth01
 
+
+## Release packaging note (v7.5.2)
+
+The release packaging script uses PlatformIO's own `FLASH_EXTRA_IMAGES` and
+`ESP32_APP_OFFSET` variables to create the merged factory image. This is
+intentional: depending on the PlatformIO/ESP-IDF integration,
+`flasher_args.json` may not be produced during a normal `pio run`.
+
+A successful build should end with lines similar to:
+
+```text
+[release] OTA: .../release/meinberg-ntp-v7.5.2-ota.bin
+[release] creating merged factory image from PlatformIO FLASH_EXTRA_IMAGES
+[release] Factory: .../release/meinberg-ntp-v7.5.2-factory.bin
+[release] Manifest: .../release/manifest.json
+```
