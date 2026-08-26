@@ -126,11 +126,13 @@ UART0 remains reserved for flashing and debugging.
 
 The Meinberg signals are connected as follows:
 
+``` text
   Signal               WT32-ETH01
   -------------------- ------------------
   Meinberg time data   GPIO35 / UART RX
   Meinberg `P_SEK`     GPIO33
   GND                  GND
+```
 
 ### Important: voltage levels
 
