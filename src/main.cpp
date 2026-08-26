@@ -72,7 +72,7 @@ static constexpr double LOCKED_BASE_DISPERSION_S = 0.005; // 5 ms
 
 // Debug output over UART0.
 static constexpr bool DEBUG_OUTPUT = true;
-static const char *FIRMWARE_VERSION = "v7.5";
+static const char *FIRMWARE_VERSION = "v7.5.2";
 
 // Status helpers are implemented below and also used by Syslog.
 static String rawStatusString();
@@ -1364,7 +1364,7 @@ void setup() {
 
   if (DEBUG_OUTPUT) {
     Serial.println();
-    Serial.println("Meinberg UA537TGP NTP server v7.5 / WT32-ETH01");
+    Serial.println("Meinberg UA537TGP NTP server v7.5.2 / WT32-ETH01");
     Serial.print("Firmware: ");
     Serial.println(FIRMWARE_VERSION);
     Serial.println("UART0 reserved for flash/debug");
