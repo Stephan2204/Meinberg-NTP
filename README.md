@@ -127,12 +127,16 @@ UART0 remains reserved for flashing and debugging.
 The Meinberg signals are connected as follows:
 
 ``` text
-  Signal               WT32-ETH01
+  Signal                    WT32-ETH01
   -------------------- ------------------
-  Meinberg time data   GPIO35 / UART RX
-  Meinberg `P_SEK`     GPIO33
-  GND                  GND
+  Meinberg time data (TX)   GPIO35 / UART RX
+  Meinberg `P_SEK`          GPIO33
+  GND                       GND
+  5V                        5V
 ```
+TX and P_SEK are identified by the wiring-scheme and were connected to the connector.
+P_SEK direct (TTL Level) and TX and RX (not needed) via MAX232 with RS232 Level! Caution!!!
+Catched the wire before the MAX232.
 
 ### Important: voltage levels
 
