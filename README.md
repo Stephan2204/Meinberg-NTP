@@ -126,17 +126,11 @@ UART0 remains reserved for flashing and debugging.
 
 The Meinberg signals are connected as follows:
 
-``` text
-  Signal                    WT32-ETH01
+  Signal               WT32-ETH01
   -------------------- ------------------
-  Meinberg time data (TX)   GPIO35 / UART RX
-  Meinberg `P_SEK`          GPIO33
-  GND                       GND
-  5V                        5V
-```
-TX and P_SEK are identified by the wiring-scheme and were connected to the connector.
-P_SEK direct (TTL Level) and TX and RX (not needed) via MAX232 with RS232 Level! Caution!!!
-Catched the wire before the MAX232.
+  Meinberg time data   GPIO35 / UART RX
+  Meinberg `P_SEK`     GPIO33
+  GND                  GND
 
 ### Important: voltage levels
 
@@ -389,69 +383,6 @@ parts required for an initial installation.
 The release files are intentionally ignored by Git. They are suitable
 as binary assets for a GitHub Release.
 
-## Release files – which image should I use?
-
-Each release provides two firmware images for different purposes:
-
-| File | Purpose |
-|---|---|
-| `meinberg-ntp-vX.Y.Z-factory.bin` | **First installation / recovery** of a new or erased WT32-ETH01 |
-| `meinberg-ntp-vX.Y.Z-ota.bin` | **Firmware update** of an already running Meinberg NTP server via the Web interface |
-
-### Factory image
-
-Use the `*-factory.bin` image when installing the firmware on a
-WT32-ETH01 for the first time.
-
-It is a merged ESP32 flash image containing the application and the
-additional flash components required for a complete installation,
-including the bootloader and partition information.
-
-Flash the factory image at address `0x0`.
-
-Example:
-
-```bash
-python -m esptool --chip esp32 -p /dev/ttyUSB0 write_flash 0x0 \
-  meinberg-ntp-vX.Y.Z-factory.bin
-```
-
-Replace `/dev/ttyUSB0` with the serial port used on your system.
-
-The factory image can also be used for recovery when the existing flash
-contents should be replaced completely.
-
-**Do not upload the factory image using the Web Firmware Update page.**
-
-### OTA image
-
-Use the `*-ota.bin` image for normal firmware updates on an already
-installed and running Meinberg NTP server.
-
-Open the device Web interface, select **Firmware Update**, authenticate
-with the configured Web administrator credentials, and upload:
-
-```text
-meinberg-ntp-vX.Y.Z-ota.bin
-```
-
-From firmware v7.5 onward, firmware update and reboot are protected by
-the configured Web administrator credentials.
-
-**Do not flash the OTA image at address `0x0` for a first installation.**
-
-### Quick decision
-
-```text
-New / erased WT32-ETH01
-        |
-        +--> factory.bin --> serial flashing / ESP Web Tools
-
-Existing Meinberg NTP server
-        |
-        +--> ota.bin --> Web Firmware Update
-```
-
 ## First installation
 
 A new or erased WT32-ETH01 cannot be initialized with the OTA
@@ -462,32 +393,8 @@ There are three practical installation methods.
 
 ### Method 1: PlatformIO upload
 
-Connect an FT232, CH340 or similar USB-to-UART adapter to UART0 of the
-WT32-ETH01. The UART logic level must be **3.3 V**.
-
-Typical wiring:
-
-| USB-to-UART adapter | WT32-ETH01 |
-|---|---|
-| GND | GND |
-| TXD | GPIO3 / RX0 |
-| RXD | GPIO1 / TX0 |
-
-TX and RX are crossed: adapter TXD goes to WT32 RX0, and adapter RXD
-goes to WT32 TX0.
-
-Power the WT32-ETH01 through its normal **5 V input**. Do not rely on
-the 3.3 V output of an FT232/CH340 adapter to power the complete
-WT32-ETH01 board.
-
-To enter the ESP32 serial bootloader:
-
-1. Connect **GPIO0 to GND**.
-2. Reset or power-cycle the WT32-ETH01.
-3. Release GPIO0 again.
-4. Start the upload.
-
-Then run:
+Connect a 3.3 V USB-to-UART adapter to UART0 of the WT32-ETH01 and put
+the ESP32 into its serial bootloader mode. Then run:
 
 ```bash
 pio run -t upload

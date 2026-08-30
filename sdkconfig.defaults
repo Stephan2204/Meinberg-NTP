@@ -10,3 +10,9 @@ CONFIG_LWIP_DHCP_OPTIONS_LEN=128
 
 # Required by Arduino-ESP32 3.x
 CONFIG_FREERTOS_HZ=1000
+
+# IPv6 dual stack / SLAAC
+CONFIG_LWIP_IPV6=y
+CONFIG_LWIP_IPV6_AUTOCONFIG=y
+# DHCPv6 is deliberately left disabled in v7.6.
+# CONFIG_LWIP_IPV6_DHCP6 is not set
