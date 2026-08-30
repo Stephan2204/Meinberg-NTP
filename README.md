@@ -269,6 +269,11 @@ The WT32-ETH01 operates as a DHCP client.
 In addition to receiving its own IPv4 configuration, this firmware
 explicitly requests:
 
+## IPv6 support
+SLAAC is activated and a link-local und global address will be retrieved (if possible!)
+ICMP, NTP and Webserver are available via IPv4 and IPv6.
+
+
 **DHCP Option 7 --- Log Server**
 
 This required rebuilding lwIP because the normal Arduino-ESP32 framework
@@ -319,7 +324,7 @@ Logging is event-based rather than periodic. Examples include:
 Example:
 
 ``` text
-meinberg-ntp syslog configured via DHCP option 7; server=192.168.222.4; firmware=v7.5.2
+meinberg-ntp syslog configured via DHCP option 7; server=192.168.222.4; firmware=v7.6.2
 meinberg-ntp startup state; ip=192.168.222.99; dcf_status=[#*  ]; psek=unstable; ntp=NO TIME; stratum=16
 meinberg-ntp P_SEK stable=YES; interval_us=1000011
 ```
@@ -366,13 +371,13 @@ pio run
 The managed ESP-IDF/Arduino components may remain cached in
 `managed_components/`.
 
-Starting with **v7.5.2**, a normal `pio run` also creates two release
+Starting with **v7.6.2**, a normal `pio run` also creates two release
 images in the `release/` directory:
 
 ```text
 release/
-├── meinberg-ntp-v7.5.2-ota.bin
-├── meinberg-ntp-v7.5.2-factory.bin
+├── meinberg-ntp-v7.6.2-ota.bin
+├── meinberg-ntp-v7.6.2-factory.bin
 └── manifest.json
 ```
 
@@ -408,7 +413,7 @@ After `pio run`, use the generated merged image:
 
 ```bash
 python -m esptool --chip esp32 -p /dev/ttyUSB0 write_flash 0x0 \
-  release/meinberg-ntp-v7.5.2-factory.bin
+  release/meinberg-ntp-v7.6.2-factory.bin
 ```
 
 Replace `/dev/ttyUSB0` with the serial port used on your system.
@@ -493,7 +498,7 @@ The initial idea for the code was taken from this project:
 https://github.com/G-3-3-R-T/gps-ntp-wt32-eth01
 
 
-## Release packaging note (v7.5.2)
+## Release packaging note (v7.6.2)
 
 The release packaging script uses PlatformIO's own `FLASH_EXTRA_IMAGES` and
 `ESP32_APP_OFFSET` variables to create the merged factory image. This is
@@ -503,8 +508,8 @@ intentional: depending on the PlatformIO/ESP-IDF integration,
 A successful build should end with lines similar to:
 
 ```text
-[release] OTA: .../release/meinberg-ntp-v7.5.2-ota.bin
+[release] OTA: .../release/meinberg-ntp-v7.6.2-ota.bin
 [release] creating merged factory image from PlatformIO FLASH_EXTRA_IMAGES
-[release] Factory: .../release/meinberg-ntp-v7.5.2-factory.bin
+[release] Factory: .../release/meinberg-ntp-v7.6.2-factory.bin
 [release] Manifest: .../release/manifest.json
 ```
