@@ -38,6 +38,9 @@
 #include <Preferences.h>
 #include "lwip/dhcp.h"
 #include "lwip/pbuf.h"
+#include "lwip/udp.h"
+#include "lwip/ip_addr.h"
+#include "lwip/tcpip.h"
 #include "esp_timer.h"
 #include "esp_arduino_version.h"
 
@@ -72,7 +75,7 @@ static constexpr double LOCKED_BASE_DISPERSION_S = 0.005; // 5 ms
 
 // Debug output over UART0.
 static constexpr bool DEBUG_OUTPUT = true;
-static const char *FIRMWARE_VERSION = "v7.5.2";
+static const char *FIRMWARE_VERSION = "v7.6.2";
 
 // Status helpers are implemented below and also used by Syslog.
 static String rawStatusString();
@@ -82,8 +85,9 @@ static String htmlEscape(const String &s);
 
 // ------------------------- Ethernet / UDP -------------------------
 
-WiFiUDP udp;
 WiFiUDP syslogUdp;
+static struct udp_pcb *ntpPcb = nullptr;
+static volatile bool ntpRawReady = false;
 WebServer web(80);
 
 // ------------------------- Web security -------------------------
@@ -183,6 +187,7 @@ struct TimeBase {
 };
 
 TimeBase timeBase;
+static portMUX_TYPE timeBaseMux = portMUX_INITIALIZER_UNLOCKED;
 
 static int64_t lastProcessedPsekUs = 0;
 static uint32_t lastProcessedPsekCounter = 0;
@@ -194,10 +199,17 @@ static int64_t lastPsekIntervalUs = 0;
 static int64_t lastTelegramDelayUs = 0;
 static uint32_t telegramCount = 0;
 static uint32_t ntpRequestCount = 0;
-static uint32_t lastNtpRequestMs = 0;
-static IPAddress lastNtpClientIP;
+static uint32_t ntpRequestCountV4 = 0;
+static uint32_t ntpRequestCountV6 = 0;
+static volatile uint32_t lastNtpRequestMs = 0;
+static portMUX_TYPE ntpDiagMux = portMUX_INITIALIZER_UNLOCKED;
+static char lastNtpClient[IPADDR_STRLEN_MAX] = {0};
+static volatile uint32_t lastNtpProcessingUs = 0;
+static volatile uint32_t maxNtpProcessingUs = 0;
 static bool previousEthLink = false;
 static IPAddress previousEthIP(0, 0, 0, 0);
+static String previousEthIPv6LinkLocal;
+static String previousEthIPv6Global;
 
 static portMUX_TYPE syslogMux = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint8_t dhcpLogServerBytes[4] = {0,0,0,0};
@@ -345,11 +357,14 @@ static void processDecodedTelegram(const MeinbergTime &t) {
   const bool psekStable = (stablePulseIntervals >= REQUIRED_STABLE_PULSES);
 
   // Pair the telegram's absolute UTC second with the P_SEK rising edge.
+  // Keep the core timestamp fields coherent for the lwIP NTP receive callback.
+  portENTER_CRITICAL(&timeBaseMux);
   timeBase.ntpSecondsAtPsek = toNtpSeconds(t);
   timeBase.refNtpSeconds = timeBase.ntpSecondsAtPsek;
   timeBase.psekUs = psekUs;
   timeBase.haveTime = true;
   timeBase.psekStable = psekStable;
+  portEXIT_CRITICAL(&timeBaseMux);
 
   // Receiver state:
   // '#' -> definitely not trustworthy since reset.
@@ -357,17 +372,24 @@ static void processDecodedTelegram(const MeinbergTime &t) {
   // '*' -> free-run/holdover; allow only for a bounded interval after real lock.
   if (!t.neverSynced && !t.freeRun) {
     lastLockedUs = nowUs;
+    portENTER_CRITICAL(&timeBaseMux);
     timeBase.synchronized = psekStable;
     timeBase.holdover = false;
+    portEXIT_CRITICAL(&timeBaseMux);
   } else if (!t.neverSynced && t.freeRun && lastLockedUs != 0) {
     const uint32_t holdoverAge =
         static_cast<uint32_t>((nowUs - lastLockedUs) / 1000000LL);
 
-    timeBase.holdover = (holdoverAge <= MAX_HOLDOVER_SECONDS);
-    timeBase.synchronized = psekStable && timeBase.holdover;
+    const bool holdoverOk = (holdoverAge <= MAX_HOLDOVER_SECONDS);
+    portENTER_CRITICAL(&timeBaseMux);
+    timeBase.holdover = holdoverOk;
+    timeBase.synchronized = psekStable && holdoverOk;
+    portEXIT_CRITICAL(&timeBaseMux);
   } else {
+    portENTER_CRITICAL(&timeBaseMux);
     timeBase.synchronized = false;
     timeBase.holdover = false;
+    portEXIT_CRITICAL(&timeBaseMux);
   }
 
   if (DEBUG_OUTPUT) {
@@ -428,13 +450,23 @@ static void feedMeinbergByte(uint8_t c) {
 
 // ------------------------- NTP helpers -------------------------
 
-static uint64_t currentNtpTimestamp() {
-  if (!timeBase.haveTime) return 0;
+static uint64_t ntpTimestampAtEspTime(int64_t sampleUs) {
+  bool haveTime;
+  uint32_t ntpSecondsAtPsek;
+  int64_t psekUs;
 
-  int64_t elapsedUs = esp_timer_get_time() - timeBase.psekUs;
+  portENTER_CRITICAL(&timeBaseMux);
+  haveTime = timeBase.haveTime;
+  ntpSecondsAtPsek = timeBase.ntpSecondsAtPsek;
+  psekUs = timeBase.psekUs;
+  portEXIT_CRITICAL(&timeBaseMux);
+
+  if (!haveTime) return 0;
+
+  int64_t elapsedUs = sampleUs - psekUs;
   if (elapsedUs < 0) elapsedUs = 0;
 
-  uint64_t wholeSeconds = static_cast<uint64_t>(timeBase.ntpSecondsAtPsek);
+  uint64_t wholeSeconds = static_cast<uint64_t>(ntpSecondsAtPsek);
   wholeSeconds += static_cast<uint64_t>(elapsedUs / 1000000LL);
 
   const uint32_t fracUs = static_cast<uint32_t>(elapsedUs % 1000000LL);
@@ -442,6 +474,10 @@ static uint64_t currentNtpTimestamp() {
       static_cast<uint32_t>((static_cast<uint64_t>(fracUs) << 32) / 1000000ULL);
 
   return (wholeSeconds << 32) | fraction;
+}
+
+static uint64_t currentNtpTimestamp() {
+  return ntpTimestampAtEspTime(esp_timer_get_time());
 }
 
 static void putNtpTimestamp(uint8_t *dst, uint64_t ts) {
@@ -480,30 +516,33 @@ static double currentRootDispersionSeconds() {
   return d;
 }
 
-static void sendNtpReply(const IPAddress &remoteIP, uint16_t remotePort,
-                         const uint8_t *request, uint64_t receiveTimestamp) {
-  uint8_t reply[NTP_PACKET_SIZE] = {0};
+static void buildNtpReply(uint8_t *reply,
+                          const uint8_t *request,
+                          uint64_t receiveTimestamp,
+                          uint64_t transmitTimestamp) {
+  memset(reply, 0, NTP_PACKET_SIZE);
 
-  const bool synced = timeBase.synchronized;
+  bool synced;
+  bool holdover;
+  uint32_t refNtpSeconds;
+
+  portENTER_CRITICAL(&timeBaseMux);
+  synced = timeBase.synchronized;
+  holdover = timeBase.holdover;
+  refNtpSeconds = timeBase.refNtpSeconds;
+  portEXIT_CRITICAL(&timeBaseMux);
 
   // LI=0 when synchronized, LI=3 when unsynchronized.
   // VN=4, Mode=4 (server).
   reply[0] = synced ? 0x24 : 0xE4;
-  reply[1] = synced ? 1 : 16;   // Stratum 1, or 16 = unsynchronized
-  reply[2] = request[2];        // copy client's poll interval
-  reply[3] = static_cast<uint8_t>(-10);  // ~0.98 ms precision, conservative
+  reply[1] = synced ? 1 : 16;
+  reply[2] = request[2];
+  reply[3] = static_cast<uint8_t>(-10);
 
-  // Root delay = 0.
   put32(&reply[4], 0);
-
-  // Root dispersion, 16.16 fixed point.
-  // Locked: 5 ms base value.
-  // Holdover: base value + worst-case 10 ppm quartz drift from datasheet.
-  // Unsynchronized: 1 s placeholder; clients reject us anyway (LI=3, stratum 16).
   put32(&reply[8], ntpDispersion16_16(currentRootDispersionSeconds()));
 
-  // Reference ID.
-  if (synced && timeBase.holdover) {
+  if (synced && holdover) {
     memcpy(&reply[12], "HOLD", 4);
   } else if (synced) {
     memcpy(&reply[12], "DCF ", 4);
@@ -511,54 +550,133 @@ static void sendNtpReply(const IPAddress &remoteIP, uint16_t remotePort,
     memcpy(&reply[12], "INIT", 4);
   }
 
-  // Reference timestamp: most recently accepted P_SEK.
   const uint64_t referenceTimestamp =
-      static_cast<uint64_t>(timeBase.refNtpSeconds) << 32;
+      static_cast<uint64_t>(refNtpSeconds) << 32;
   putNtpTimestamp(&reply[16], referenceTimestamp);
 
   // Originate timestamp = client's transmit timestamp.
   memcpy(&reply[24], &request[40], 8);
 
-  // Receive timestamp captured as soon as the packet was noticed.
+  // T2: timestamp taken directly when lwIP invokes the UDP receive callback.
   putNtpTimestamp(&reply[32], receiveTimestamp);
 
-  // Transmit timestamp immediately before packet transmission.
-  const uint64_t transmitTimestamp = currentNtpTimestamp();
+  // T3: timestamp taken immediately before handing the reply back to lwIP.
   putNtpTimestamp(&reply[40], transmitTimestamp);
-
-  udp.beginPacket(remoteIP, remotePort);
-  udp.write(reply, sizeof(reply));
-  udp.endPacket();
 }
 
-static void serviceNtp() {
-  const int packetSize = udp.parsePacket();
-  if (packetSize <= 0) return;
+// Raw lwIP receive callback.
+// This runs in lwIP's TCP/IP thread when the UDP datagram is delivered to the
+// NTP PCB. Therefore T2 no longer depends on Arduino loop()/parsePacket()
+// polling latency.
+static void ntpRawRecv(void *arg,
+                       struct udp_pcb *pcb,
+                       struct pbuf *p,
+                       const ip_addr_t *addr,
+                       u16_t port) {
+  (void)arg;
+  if (p == nullptr || pcb == nullptr || addr == nullptr) {
+    if (p != nullptr) pbuf_free(p);
+    return;
+  }
 
-  // Capture receive time as early as possible after parsePacket().
-  const uint64_t receiveTimestamp = currentNtpTimestamp();
+  const int64_t callbackEntryUs = esp_timer_get_time();
+  const uint64_t receiveTimestamp = ntpTimestampAtEspTime(callbackEntryUs);
+
+  if (p->tot_len < NTP_PACKET_SIZE || receiveTimestamp == 0) {
+    pbuf_free(p);
+    return;
+  }
 
   uint8_t request[NTP_PACKET_SIZE] = {0};
-  const int toRead = min(packetSize, static_cast<int>(NTP_PACKET_SIZE));
-  udp.read(request, toRead);
-
-  // Drain any oversized packet.
-  while (udp.available()) udp.read();
-
-  if (packetSize < static_cast<int>(NTP_PACKET_SIZE)) return;
-  if (!timeBase.haveTime) return;
+  if (pbuf_copy_partial(p, request, NTP_PACKET_SIZE, 0) != NTP_PACKET_SIZE) {
+    pbuf_free(p);
+    return;
+  }
+  pbuf_free(p);
 
   const uint8_t mode = request[0] & 0x07;
-  if (mode != 3) return; // NTP client request
+  if (mode != 3) return;
 
-  lastNtpClientIP = udp.remoteIP();
-  lastNtpRequestMs = millis();
+  uint8_t reply[NTP_PACKET_SIZE];
+
+  // T3 is deliberately sampled as late as practical.
+  const uint64_t transmitTimestamp =
+      ntpTimestampAtEspTime(esp_timer_get_time());
+  buildNtpReply(reply, request, receiveTimestamp, transmitTimestamp);
+
+  struct pbuf *out = pbuf_alloc(PBUF_TRANSPORT, NTP_PACKET_SIZE, PBUF_RAM);
+  if (out == nullptr) return;
+
+  if (pbuf_take(out, reply, NTP_PACKET_SIZE) == ERR_OK) {
+    udp_sendto(pcb, out, addr, port);
+  }
+  pbuf_free(out);
+
+  const bool ipv6 = IP_IS_V6(addr);
   ++ntpRequestCount;
+  if (ipv6) ++ntpRequestCountV6;
+  else ++ntpRequestCountV4;
+  lastNtpRequestMs = millis();
 
-  sendNtpReply(udp.remoteIP(), udp.remotePort(), request, receiveTimestamp);
+  char client[IPADDR_STRLEN_MAX] = {0};
+  ipaddr_ntoa_r(addr, client, sizeof(client));
+  portENTER_CRITICAL(&ntpDiagMux);
+  strncpy(lastNtpClient, client, sizeof(lastNtpClient) - 1);
+  lastNtpClient[sizeof(lastNtpClient) - 1] = '\0';
+  portEXIT_CRITICAL(&ntpDiagMux);
+
+  const uint32_t processingUs =
+      static_cast<uint32_t>(esp_timer_get_time() - callbackEntryUs);
+  lastNtpProcessingUs = processingUs;
+  if (processingUs > maxNtpProcessingUs) {
+    maxNtpProcessingUs = processingUs;
+  }
 }
 
+static void startRawNtpInTcpipThread(void *arg) {
+  (void)arg;
 
+  ntpPcb = udp_new_ip_type(IPADDR_TYPE_ANY);
+  if (ntpPcb == nullptr) {
+    ntpRawReady = false;
+    if (DEBUG_OUTPUT) Serial.println("NTP raw lwIP: PCB allocation failed");
+    return;
+  }
+
+  const err_t err = udp_bind(ntpPcb, IP_ANY_TYPE, NTP_PORT);
+  if (err != ERR_OK) {
+    if (DEBUG_OUTPUT) {
+      Serial.printf("NTP raw lwIP: UDP/123 bind failed (%d)\n", static_cast<int>(err));
+    }
+    udp_remove(ntpPcb);
+    ntpPcb = nullptr;
+    ntpRawReady = false;
+    return;
+  }
+
+  udp_recv(ntpPcb, ntpRawRecv, nullptr);
+  ntpRawReady = true;
+
+  if (DEBUG_OUTPUT) {
+    Serial.println("NTP raw lwIP dual-stack UDP/123 listening");
+  }
+}
+
+static void startRawNtp() {
+  // Raw lwIP APIs must be called from the TCP/IP thread.
+  const err_t err = tcpip_callback(startRawNtpInTcpipThread, nullptr);
+  if (err != ERR_OK && DEBUG_OUTPUT) {
+    Serial.printf("NTP raw lwIP: tcpip_callback failed (%d)\n", static_cast<int>(err));
+  }
+}
+
+static String lastNtpClientText() {
+  char copy[IPADDR_STRLEN_MAX] = {0};
+  portENTER_CRITICAL(&ntpDiagMux);
+  strncpy(copy, lastNtpClient, sizeof(copy) - 1);
+  portEXIT_CRITICAL(&ntpDiagMux);
+  return copy[0] ? String(copy) : String("-");
+}
 
 
 // ------------------------- DHCP Option 7 test -------------------------
@@ -779,24 +897,95 @@ static void monitorStateForSyslog() {
 
 // ------------------------- Firmware update (Web OTA) -------------------------
 
+static String formatBytes(uint64_t bytes) {
+  char b[32];
+  if (bytes >= 1024ULL * 1024ULL) {
+    snprintf(b, sizeof(b), "%.2f MiB",
+             static_cast<double>(bytes) / (1024.0 * 1024.0));
+  } else if (bytes >= 1024ULL) {
+    snprintf(b, sizeof(b), "%.1f KiB",
+             static_cast<double>(bytes) / 1024.0);
+  } else {
+    snprintf(b, sizeof(b), "%llu B",
+             static_cast<unsigned long long>(bytes));
+  }
+  return String(b);
+}
+
 static void handleUpdatePage() {
   if (!requireWebAdmin()) return;
+
+  const uint32_t flashSize = ESP.getFlashChipSize();
+  const uint32_t sketchSize = ESP.getSketchSize();
+  const uint32_t freeSketchSpace = ESP.getFreeSketchSpace();
+  const uint32_t heapSize = ESP.getHeapSize();
+  const uint32_t freeHeap = ESP.getFreeHeap();
+  const uint32_t minFreeHeap = ESP.getMinFreeHeap();
+  const uint32_t maxAllocHeap = ESP.getMaxAllocHeap();
+  const uint32_t psramSize = ESP.getPsramSize();
+  const uint32_t freePsram = ESP.getFreePsram();
+
   String page;
-  page.reserve(2500);
+  page.reserve(5200);
   page += F(
     "<!doctype html><html><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<title>Firmware Update</title>"
     "<style>"
-    "body{font-family:system-ui,sans-serif;max-width:700px;margin:2rem auto;padding:0 1rem;background:#f5f5f5;color:#222}"
-    ".box{background:white;padding:1.2rem;border-radius:.4rem}"
+    "body{font-family:system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;background:#f5f5f5;color:#222}"
+    ".box{background:white;padding:1.2rem;border-radius:.4rem;margin-bottom:1rem}"
+    "table{border-collapse:collapse;width:100%}td{padding:.35rem .2rem;border-bottom:1px solid #eee}"
+    "td:first-child{font-weight:600;width:48%}"
     "input,button{font-size:1rem;margin:.5rem 0;padding:.5rem}"
-    ".warn{color:#8a4b00}"
+    ".warn{color:#8a4b00}.ok{color:#17823b;font-weight:700}.note{color:#666}"
     "</style></head><body>"
     "<h1>Meinberg NTP Firmware Update</h1>"
+  );
+
+  page += F("<div class='box'><h2>System / Memory</h2><table>");
+
+  page += F("<tr><td>Firmware</td><td>");
+  page += FIRMWARE_VERSION;
+  page += F("</td></tr><tr><td>Flash</td><td>");
+  page += formatBytes(flashSize);
+  page += F("</td></tr><tr><td>Current sketch / app</td><td>");
+  page += formatBytes(sketchSize);
+  page += F("</td></tr><tr><td>Free OTA / app space</td><td>");
+  page += formatBytes(freeSketchSpace);
+
+  page += F("</td></tr><tr><td>Heap total</td><td>");
+  page += formatBytes(heapSize);
+  page += F("</td></tr><tr><td>Heap free</td><td>");
+  page += formatBytes(freeHeap);
+  page += F("</td></tr><tr><td>Minimum free heap</td><td>");
+  page += formatBytes(minFreeHeap);
+  page += F("</td></tr><tr><td>Largest free block</td><td>");
+  page += formatBytes(maxAllocHeap);
+
+  page += F("</td></tr><tr><td>PSRAM</td><td>");
+  if (psramSize > 0) {
+    page += formatBytes(psramSize);
+    page += F(" total / ");
+    page += formatBytes(freePsram);
+    page += F(" free");
+  } else {
+    page += F("<span class='note'>not present</span>");
+  }
+
+  page += F("</td></tr><tr><td>CPU</td><td>");
+  page += String(ESP.getCpuFreqMHz());
+  page += F(" MHz / ");
+  page += String(ESP.getChipCores());
+  page += F(" cores</td></tr><tr><td>Chip revision</td><td>");
+  page += String(ESP.getChipRevision());
+  page += F("</td></tr></table></div>");
+
+  page += F(
     "<div class='box'>"
-    "<p>Select a compiled ESP32 <code>.bin</code> file.</p>"
-    "<p class='warn'><b>Important:</b> Do not interrupt power or Ethernet during the upload.</p>"
+    "<h2>Firmware upload</h2>"
+    "<p>Select the application/OTA <code>.bin</code> file.</p>"
+    "<p class='warn'><b>Important:</b> Do not upload the merged factory image here. "
+    "Do not interrupt power or Ethernet during the upload.</p>"
     "<form method='POST' action='/update' enctype='multipart/form-data'>"
     "<input type='file' name='firmware' accept='.bin,application/octet-stream' required><br>"
     "<button type='submit'>Upload and reboot</button>"
@@ -804,6 +993,7 @@ static void handleUpdatePage() {
     "<p><a href='/'>Back to status</a></p>"
     "</div></body></html>"
   );
+
   web.send(200, "text/html; charset=utf-8", page);
 }
 
@@ -1057,7 +1247,7 @@ static void handleRoot() {
     "<!doctype html><html><head>"
     "<meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<meta http-equiv='refresh' content='2'>"
+    "<meta http-equiv='refresh' content='30'>"
     "<title>Meinberg NTP</title>"
     "<style>"
     "body{font-family:system-ui,sans-serif;max-width:850px;margin:2rem auto;padding:0 1rem;background:#f5f5f5;color:#222}"
@@ -1072,7 +1262,7 @@ static void handleRoot() {
     "<div class='note'>WT32-ETH01 &middot; firmware "
   );
   page += FIRMWARE_VERSION;
-  page += F(" &middot; auto refresh every 2 s");
+  page += F(" &middot; auto refresh every 30 s");
   if (webAdminConfigured) {
     page += F(" &middot; <a href='/update'>Firmware Update</a>");
   } else {
@@ -1135,13 +1325,22 @@ static void handleRoot() {
   } else {
     page += F("-");
   }
-  page += F("</td></tr><tr><td>NTP requests</td><td>");
+  page += F("</td></tr><tr><td>NTP requests total</td><td>");
   page += String(ntpRequestCount);
+  page += F("</td></tr><tr><td>NTP requests IPv4</td><td>");
+  page += String(ntpRequestCountV4);
+  page += F("</td></tr><tr><td>NTP requests IPv6</td><td>");
+  page += String(ntpRequestCountV6);
   page += F("</td></tr><tr><td>Last NTP client</td><td>");
-  page += (ntpRequestCount > 0) ? lastNtpClientIP.toString() : String("-");
+  page += (ntpRequestCount > 0) ? lastNtpClientText() : String("-");
   page += F("</td></tr><tr><td>Last NTP request</td><td>");
   page += ageText(lastNtpRequestMs);
-  page += F("</td></tr></table>");
+  page += F("</td></tr><tr><td>NTP engine</td><td>raw lwIP callback</td></tr>");
+  page += F("<tr><td>Last callback processing</td><td>");
+  page += String(lastNtpProcessingUs);
+  page += F(" &micro;s</td></tr><tr><td>Max callback processing</td><td>");
+  page += String(maxNtpProcessingUs);
+  page += F(" &micro;s</td></tr></table>");
 
   // 3) P_SEK
   page += F("<h2>P_SEK</h2><table>");
@@ -1169,9 +1368,19 @@ static void handleRoot() {
   page += F("<h2>Ethernet</h2><table>");
   page += F("<tr><td>Link</td><td><span class='");
   page += link ? F("ok'>UP") : F("bad'>DOWN");
-  page += F("</span></td></tr><tr><td>IP address</td><td>");
+  page += F("</span></td></tr><tr><td>IPv4 address</td><td>");
   page += ip.toString();
-  page += F("</td></tr></table>");
+  page += F("</td></tr><tr><td>IPv6 link-local</td><td>");
+  page += ETH.linkLocalIPv6().toString();
+  page += F("</td></tr><tr><td>IPv6 SLAAC / global</td><td>");
+  if (ETH.hasGlobalIPv6()) {
+    page += F("<span class='ok'>");
+    page += ETH.globalIPv6().toString();
+    page += F("</span>");
+  } else {
+    page += F("<span class='note'>not available</span>");
+  }
+  page += F("</td></tr><tr><td>IPv6 configuration</td><td>SLAAC</td></tr></table>");
 
   // 5) Syslog
   page += F("<h2>Syslog</h2><table>");
@@ -1223,6 +1432,10 @@ static void handleStatusJson() {
   json += ETH.linkUp() ? F("true") : F("false");
   json += F(",\"ip\":\"");
   json += ETH.localIP().toString();
+  json += F("\",\"ipv6_link_local\":\"");
+  json += ETH.linkLocalIPv6().toString();
+  json += F("\",\"ipv6_global\":\"");
+  json += ETH.hasGlobalIPv6() ? ETH.globalIPv6().toString() : String("");
   json += F("\",\"meinberg_time\":\"");
   json += formatLastTelegramUtc();
   json += F("\",\"raw_status\":\"");
@@ -1255,8 +1468,16 @@ static void handleStatusJson() {
   json += String(millis() / 1000U);
   json += F(",\"ntp_requests\":");
   json += String(ntpRequestCount);
+  json += F(",\"ntp_requests_ipv4\":");
+  json += String(ntpRequestCountV4);
+  json += F(",\"ntp_requests_ipv6\":");
+  json += String(ntpRequestCountV6);
   json += F(",\"last_ntp_client\":\"");
-  json += (ntpRequestCount > 0) ? lastNtpClientIP.toString() : String("");
+  json += (ntpRequestCount > 0) ? lastNtpClientText() : String("");
+  json += F("\",\"ntp_engine\":\"raw_lwip_callback\",\"ntp_callback_last_us\":");
+  json += String(lastNtpProcessingUs);
+  json += F(",\"ntp_callback_max_us\":");
+  json += String(maxNtpProcessingUs);
   json += F("}");
 
   web.send(200, "application/json; charset=utf-8", json);
@@ -1314,8 +1535,25 @@ static void monitorEthernet() {
   if (ip != previousEthIP) {
     previousEthIP = ip;
     if (DEBUG_OUTPUT) {
-      Serial.print("Ethernet: IP ");
+      Serial.print("Ethernet: IPv4 ");
       Serial.println(ip);
+    }
+  }
+
+  const String ll = ETH.linkLocalIPv6().toString();
+  const String global = ETH.hasGlobalIPv6() ? ETH.globalIPv6().toString() : String("");
+  if (ll != previousEthIPv6LinkLocal) {
+    previousEthIPv6LinkLocal = ll;
+    if (DEBUG_OUTPUT) {
+      Serial.print("Ethernet: IPv6 link-local ");
+      Serial.println(ll.length() ? ll : String("-"));
+    }
+  }
+  if (global != previousEthIPv6Global) {
+    previousEthIPv6Global = global;
+    if (DEBUG_OUTPUT) {
+      Serial.print("Ethernet: IPv6 SLAAC/global ");
+      Serial.println(global.length() ? global : String("not available"));
     }
   }
 }
@@ -1345,6 +1583,14 @@ static void startEthernet() {
     Serial.println("ETH.begin() failed");
   }
 
+  // IPv6: create link-local addressing and enable SLAAC/Router Advertisements.
+  if (ok) {
+    const bool ipv6ok = ETH.enableIPv6(true);
+    if (DEBUG_OUTPUT) {
+      Serial.printf("Ethernet IPv6: %s\n", ipv6ok ? "enabled" : "enable failed");
+    }
+  }
+
   // Give DHCP a little time. The loop remains functional even if no cable exists.
   const uint32_t start = millis();
   while (ETH.localIP() == IPAddress(0, 0, 0, 0) &&
@@ -1353,8 +1599,12 @@ static void startEthernet() {
   }
 
   if (DEBUG_OUTPUT) {
-    Serial.print("Ethernet IP: ");
+    Serial.print("Ethernet IPv4: ");
     Serial.println(ETH.localIP());
+    Serial.print("Ethernet IPv6 link-local: ");
+    Serial.println(ETH.linkLocalIPv6());
+    Serial.print("Ethernet IPv6 SLAAC/global: ");
+    Serial.println(ETH.hasGlobalIPv6() ? ETH.globalIPv6().toString() : String("not available yet"));
   }
 }
 
@@ -1364,7 +1614,7 @@ void setup() {
 
   if (DEBUG_OUTPUT) {
     Serial.println();
-    Serial.println("Meinberg UA537TGP NTP server v7.5.2 / WT32-ETH01");
+    Serial.println("Meinberg UA537TGP NTP server v7.6.2 / WT32-ETH01");
     Serial.print("Firmware: ");
     Serial.println(FIRMWARE_VERSION);
     Serial.println("UART0 reserved for flash/debug");
@@ -1386,17 +1636,15 @@ void setup() {
 
   startEthernet();
 
-  if (udp.begin(NTP_PORT)) {
-    if (DEBUG_OUTPUT) Serial.println("UDP/123 listening");
-  } else {
-    if (DEBUG_OUTPUT) Serial.println("Failed to bind UDP/123");
-  }
+  startRawNtp();
 
   loadWebSecurity();
   startWebServer();
 
   previousEthLink = ETH.linkUp();
   previousEthIP = ETH.localIP();
+  previousEthIPv6LinkLocal = ETH.linkLocalIPv6().toString();
+  previousEthIPv6Global = ETH.hasGlobalIPv6() ? ETH.globalIPv6().toString() : String("");
 }
 
 void loop() {
@@ -1404,7 +1652,6 @@ void loop() {
     feedMeinbergByte(static_cast<uint8_t>(MeinbergSerial.read()));
   }
 
-  serviceNtp();
   web.handleClient();
   monitorEthernet();
   processDhcpOption7();
@@ -1418,8 +1665,10 @@ void loop() {
     snapshotPsek(psekUs, dummy);
 
     if (psekUs == 0 || (esp_timer_get_time() - psekUs) > 5000000LL) {
+      portENTER_CRITICAL(&timeBaseMux);
       timeBase.synchronized = false;
       timeBase.psekStable = false;
+      portEXIT_CRITICAL(&timeBaseMux);
       stablePulseIntervals = 0;
 
       if (DEBUG_OUTPUT) {
