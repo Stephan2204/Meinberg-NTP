@@ -157,8 +157,15 @@ Meinberg signal ---- 1 kOhm ----+---- ESP32 input
                                GND
 ```
 
+### Wiring for Option A:
+
+![WiFiWatch Wiring Diagram](docs/Meinberg_WT32-ETH01_wiring.png)
+
+
 This is appropriate only after verifying that the selected internal
 signals are TTL-level signals and have the expected voltage.
+
+
 
 ### Option B: rear COM0/COM1 RS-232 port
 
