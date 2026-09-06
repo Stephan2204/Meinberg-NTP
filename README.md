@@ -159,7 +159,7 @@ Meinberg signal ---- 1 kOhm ----+---- ESP32 input
 
 ### Wiring for Option A:
 
-![WiFiWatch Wiring Diagram](docs/Meinberg_WT32-ETH01_wiring.png)
+![WiFiWatch Wiring Diagram](docs/images/Meinberg_WT32-ETH01_wiring.png)
 
 
 This is appropriate only after verifying that the selected internal
